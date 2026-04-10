@@ -1,0 +1,1 @@
+"""ANPR application package."""

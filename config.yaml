@@ -1,0 +1,56 @@
+applications:
+  anpr:
+    database_path: "/home/abdullah/PycharmProjects/UET_Survelliance_Demo/assets/database/plates.db"
+    live_frames_dir: "/home/abdullah/PycharmProjects/UET_Survelliance_Demo/outputs/live"
+    icon_path: "/home/abdullah/PycharmProjects/UETSafeCampusDashboard/assets/images/anpr_card.png"
+
+  lab_surveillance:
+    root_dir: "/home/abdullah/PycharmProjects/CvmlLabSurviellance"
+    face_db_path: "/home/abdullah/PycharmProjects/CvmlLabSurviellance/faces.db"
+    activity_db_path: "/home/abdullah/PycharmProjects/CvmlLabSurviellance/activity_logs.db"
+    live_image_path: "/home/abdullah/PycharmProjects/CvmlLabSurviellance/outputs/live/live_latest.jpg"
+    live_frames_dir: "/home/abdullah/PycharmProjects/CvmlLabSurviellance/outputs/live"
+    activity_images_dir: "/home/abdullah/PycharmProjects/CvmlLabSurviellance/outputs/activities"
+    region_output_dir: "/home/abdullah/PycharmProjects/CvmlLabSurviellance/outputs/regions"
+    icon_path: "/home/abdullah/PycharmProjects/UETSafeCampusDashboard/assets/images/lab_surveillance_card.png"
+
+  classroom_surveillance:
+    root_dir: "/home/abdullah/PycharmProjects/Classroom Survelliance"
+    face_db_path: "/home/abdullah/PycharmProjects/Classroom Survelliance/assets/database/faces.db"
+    student_logs_db_path: "/home/abdullah/PycharmProjects/Classroom Survelliance/outputs/student_logs.db"
+    live_frames_dir: "/home/abdullah/PycharmProjects/Classroom Survelliance/outputs/latest_frames"
+    stream_status_dir: "/home/abdullah/PycharmProjects/Classroom Survelliance/outputs/stream_status"
+    icon_path: "/home/abdullah/PycharmProjects/UETSafeCampusDashboard/assets/images/classroom_srvelliance.png"
+
+  attendance:
+    root_dir: "/home/abdullah/PycharmProjects/Ai Classroom Attendance"
+    face_db_path: "/home/abdullah/PycharmProjects/Ai Classroom Attendance/faces.db"
+    activity_db_path: "/home/abdullah/PycharmProjects/Ai Classroom Attendance/activity_logs.db"
+    live_frames_dir: "/home/abdullah/PycharmProjects/Ai Classroom Attendance/live_frames"
+    icon_path: "/home/abdullah/PycharmProjects/UETSafeCampusDashboard/assets/images/walk_thorough_attendance_system.png"
+
+face_registration:
+  guide_width_ratio: 0.38
+  guide_height_ratio: 0.58
+  guide_min_size_ratio: 0.08
+  guide_max_size_ratio: 0.92
+  raw_yaw_threshold: 30.0
+  raw_pitch_up_threshold: -14.0
+  raw_pitch_down_threshold: 18.0
+  raw_pitch_deadzone: 10.0
+  frontal_yaw_deadzone: 33.0
+  frontal_pitch_deadzone: 10.0
+  baseline_left_threshold: -42.0
+  baseline_right_threshold: 12.0
+  baseline_up_pitch_threshold: 5.0
+  baseline_down_pitch_threshold: -4.0
+  baseline_up_vertical_ratio_delta: -0.12
+  baseline_down_vertical_ratio_delta: 0.10
+  baseline_level_vertical_ratio_deadzone: 0.06
+  fallback_left_yaw_ratio: -0.20
+  fallback_right_yaw_ratio: 0.20
+  fallback_up_pitch_ratio: 0.15
+  fallback_down_pitch_ratio: 0.03
+  face_crop_expand_ratio: 0.18
+  pose_vote_window: 3
+  angle_smooth_factor: 0.75

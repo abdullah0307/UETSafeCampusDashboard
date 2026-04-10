@@ -1,0 +1,1 @@
+"""Classroom surveillance application package."""
