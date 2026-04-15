@@ -943,48 +943,6 @@ class LiveMonitorPage(BasePage):
             return
 
         st.divider()
-        
-        # Recording controls
-        recording_col, status_col = st.columns([1, 3])
-        
-        with recording_col:
-            # Initialize recording state
-            if "is_recording" not in st.session_state:
-                st.session_state.is_recording = False
-            if "recording_start_time" not in st.session_state:
-                st.session_state.recording_start_time = None
-            if "recorded_frames" not in st.session_state:
-                st.session_state.recorded_frames = {}
-            if "video_writers" not in st.session_state:
-                st.session_state.video_writers = {}
-            
-            # Recording toggle button
-            if st.session_state.is_recording:
-                if st.button("⏹️ Stop Recording", type="primary", use_container_width=True):
-                    self._stop_recording(selected_cameras)
-            else:
-                if st.button("⏺️ Start Recording", type="secondary", use_container_width=True):
-                    self._start_recording(selected_cameras)
-        
-        with status_col:
-            if st.session_state.is_recording:
-                elapsed = datetime.now() - st.session_state.recording_start_time
-                elapsed_str = str(elapsed).split('.')[0]  # Remove microseconds
-                st.success(f"🔴 Recording... ({elapsed_str})")
-                total_frames = sum(len(frames) for frames in st.session_state.recorded_frames.values())
-                st.caption(f"Total frames captured: {total_frames}")
-            else:
-                st.info("⚪ Not recording")
-        
-        # Show saved recordings info
-        if "saved_recordings" not in st.session_state:
-            st.session_state.saved_recordings = []
-        
-        if st.session_state.saved_recordings:
-            st.divider()
-            st.subheader("💾 Saved Recordings")
-            for recording_info in st.session_state.saved_recordings[-5:]:  # Show last 5
-                st.caption(f"✅ {recording_info}")
 
         latest_frame_mtime = 0.0
 
@@ -1022,10 +980,6 @@ class LiveMonitorPage(BasePage):
                             )
 
                             st.caption(f"Last updated: {modified_time}")
-                            
-                            # Capture frame if recording
-                            if st.session_state.is_recording:
-                                self._capture_frame(cam, image_path)
 
                         except Exception:
                             # Frame being written or corrupted
@@ -1040,74 +994,6 @@ class LiveMonitorPage(BasePage):
 
         # Fast polling for near-instant refresh when writer updates frames.
         st_autorefresh(interval=400, key="live_refresh_fast")
-    
-    def _start_recording(self, cameras):
-        """Start recording frames from selected cameras"""
-        st.session_state.is_recording = True
-        st.session_state.recording_start_time = datetime.now()
-        st.session_state.recorded_frames = {cam: [] for cam in cameras}
-        st.session_state.video_writers = {}
-        st.rerun()
-    
-    def _stop_recording(self, cameras):
-        """Stop recording and save video files"""
-        st.session_state.is_recording = False
-        
-        # Create videos directory
-        recordings_dir = os.path.join(os.path.dirname(self.config.live_frames_dir), "recordings")
-        os.makedirs(recordings_dir, exist_ok=True)
-        
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        saved_files = []
-        
-        # Save video for each camera
-        for cam in cameras:
-            frames = st.session_state.recorded_frames.get(cam, [])
-            if len(frames) > 0:
-                # Create video file
-                video_path = os.path.join(recordings_dir, f"{cam}_{timestamp}.mp4")
-                
-                # Get frame dimensions from first frame
-                height, width = frames[0].shape[:2]
-                
-                # Create video writer
-                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-                fps = 10  # Adjust FPS as needed
-                video_writer = cv2.VideoWriter(video_path, fourcc, fps, (width, height))
-                
-                # Write frames
-                for frame in frames:
-                    video_writer.write(frame)
-                
-                video_writer.release()
-                saved_files.append(f"{cam}: {len(frames)} frames → {os.path.basename(video_path)}")
-        
-        # Clear recorded frames
-        st.session_state.recorded_frames = {}
-        
-        # Save recording info
-        if saved_files:
-            recording_info = f"Recording at {timestamp}: " + ", ".join(saved_files)
-            st.session_state.saved_recordings.append(recording_info)
-            st.success(f"✅ Recording saved! {len(saved_files)} video(s) created.")
-        
-        st.rerun()
-    
-    def _capture_frame(self, camera_id, image_path):
-        """Capture a frame from the camera and store it for recording"""
-        try:
-            # Read image using OpenCV
-            frame = cv2.imread(image_path)
-            if frame is not None:
-                # Initialize list for this camera if not exists
-                if camera_id not in st.session_state.recorded_frames:
-                    st.session_state.recorded_frames[camera_id] = []
-                
-                # Add frame to recording buffer
-                st.session_state.recorded_frames[camera_id].append(frame)
-        except Exception as e:
-            # Silently ignore frame capture errors to avoid disrupting the live view
-            pass
 
 
 class AnalyticsPage(BasePage):

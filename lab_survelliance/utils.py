@@ -52,14 +52,14 @@ FACE_REGISTRATION_DEFAULTS = {
     "guide_height_ratio": 0.58,
     "guide_min_size_ratio": 0.08,
     "guide_max_size_ratio": 0.92,
-    "raw_yaw_threshold": 30.0,
+    "raw_yaw_threshold": 35.0,
     "raw_pitch_up_threshold": -14.0,
     "raw_pitch_down_threshold": 18.0,
     "raw_pitch_deadzone": 10.0,
-    "frontal_yaw_deadzone": 33.0,
+    "frontal_yaw_deadzone": 40.0,
     "frontal_pitch_deadzone": 10.0,
-    "baseline_left_threshold": -42.0,
-    "baseline_right_threshold": 12.0,
+    "baseline_left_threshold": -50.0,
+    "baseline_right_threshold": 18.0,
     "baseline_up_pitch_threshold": 5.0,
     "baseline_down_pitch_threshold": -4.0,
     "baseline_up_vertical_ratio_delta": -0.12,
@@ -1982,11 +1982,26 @@ class SurveillanceRepository:
                 # Keep latest sample mirrored in users.face_image for compatibility.
                 latest_face = samples[-1].get("face_image")
                 if latest_face:
-                    conn.execute(
-                        "INSERT OR REPLACE INTO users (username, face_image, created_at) "
-                        "VALUES (?, ?, datetime('now'))",
-                        (clean_username, latest_face),
-                    )
+                    # Check if user exists first
+                    existing_user = conn.execute(
+                        "SELECT 1 FROM users WHERE username = ?",
+                        (clean_username,),
+                    ).fetchone()
+                    
+                    if existing_user:
+                        # User exists, just update face_image
+                        conn.execute(
+                            "UPDATE users SET face_image = ?, created_at = datetime('now') "
+                            "WHERE username = ?",
+                            (latest_face, clean_username),
+                        )
+                    else:
+                        # User doesn't exist, insert with empty embedding
+                        conn.execute(
+                            "INSERT INTO users (username, face_image, embedding, created_at) "
+                            "VALUES (?, ?, ?, datetime('now'))",
+                            (clean_username, latest_face, b''),
+                        )
                 conn.commit()
         except sqlite3.Error as exc:
             return False, f"Database error: {exc}"
@@ -2612,6 +2627,18 @@ class FaceRegistrationPage(BasePage):
             st.error("MediaPipe Face Mesh is not available.")
             return
 
+        # Show diagnostic info for troubleshooting
+        with st.expander("🔧 Camera Diagnostics", expanded=False):
+            st.caption(f"**streamlit-webrtc available:** {webrtc_streamer is not None}")
+            st.caption(f"**WebRtcMode available:** {WebRtcMode is not None}")
+            st.caption(f"**av (PyAV) available:** {av is not None}")
+            st.caption(f"**mediapipe available:** {mp is not None}")
+            try:
+                import streamlit_webrtc
+                st.caption(f"**streamlit-webrtc version:** {streamlit_webrtc.__version__}")
+            except:
+                st.caption("**streamlit-webrtc version:** Unknown")
+
         current_url = str(getattr(st.context, "url", "") or "").strip()
         if not _is_secure_camera_context():
             st.error(
@@ -2654,7 +2681,9 @@ class FaceRegistrationPage(BasePage):
                 pose = str(row.get("pose", "")).strip()
                 image = row.get("face_image")
                 if pose and isinstance(image, (bytes, bytearray)) and image:
-                    state["captured_samples"][pose] = image
+                    # Only load from DB if not already captured in current session
+                    if pose not in state["captured_samples"]:
+                        state["captured_samples"][pose] = image
 
         remaining_poses = [
             pose for pose in self.TARGET_POSES if pose not in state["captured_samples"]
@@ -2682,20 +2711,38 @@ class FaceRegistrationPage(BasePage):
         stream_col, crop_col = st.columns([2.4, 1.2])
         # Browser-to-app capture works with host ICE candidates here; avoiding
         # external STUN also prevents background retries during teardown.
-        rtc_config = {"iceServers": []}
+        # Add fallback ICE servers for better connectivity
+        rtc_config = {
+            "iceServers": [
+                {"urls": "stun:stun.l.google.com:19302"},
+                {"urls": "stun:stun1.l.google.com:19302"},
+            ]
+        }
         should_stream = target_pose != "Done"
         with stream_col:
             with st.container(border=True):
                 st.caption("Live Input Stream")
-                ctx = webrtc_streamer(
-                    key="face_guided_capture_webrtc",
-                    mode=WebRtcMode.SENDRECV,
-                    media_stream_constraints={"video": True, "audio": False},
-                    rtc_configuration=rtc_config,
-                    desired_playing_state=should_stream,
-                    async_processing=True,
-                    video_processor_factory=ThreadedFaceCaptureProcessor,
-                )
+                try:
+                    ctx = webrtc_streamer(
+                        key="face_guided_capture_webrtc",
+                        mode=WebRtcMode.SENDRECV,
+                        media_stream_constraints={
+                            "video": {
+                                "width": {"ideal": 720},
+                                "height": {"ideal": 640},
+                                "facingMode": "user",
+                            },
+                            "audio": False,
+                        },
+                        rtc_configuration=rtc_config,
+                        desired_playing_state=should_stream,
+                        async_processing=True,
+                        video_processor_factory=ThreadedFaceCaptureProcessor,
+                    )
+                except Exception as e:
+                    st.error(f"Failed to initialize camera streamer: {str(e)}")
+                    st.caption("Try refreshing the page or checking browser camera permissions.")
+                    ctx = None
 
         stream_error = ""
         if ctx is not None and hasattr(ctx, "state") and hasattr(ctx.state, "signalling"):
@@ -2725,6 +2772,14 @@ class FaceRegistrationPage(BasePage):
             st.caption(
                 "Open the app with `http://localhost:8501` on the same machine, or serve it over HTTPS if you need LAN access."
             )
+            return
+
+        if ctx is None:
+            st.error("Camera streamer failed to initialize.")
+            st.caption("Please check:")
+            st.caption("1. Browser camera permissions are granted")
+            st.caption("2. You're using a supported browser (Chrome, Edge, Firefox)")
+            st.caption("3. No other application is using the camera")
             return
 
         if not ctx.state.playing:
@@ -2771,25 +2826,68 @@ class FaceRegistrationPage(BasePage):
         else:
             state["stable_counter"] = 0
 
-        info_cols = st.columns([1, 1, 1, 2])
+        info_cols = st.columns([1, 1, 1, 1, 1])
         info_cols[0].metric("Target", target_pose)
         info_cols[1].metric("Detected", current_pose)
         info_cols[2].metric(
             "Progress", f"{state['stable_counter']}/{self.STABLE_POLLS_REQUIRED}"
         )
+        
+        # Manual capture button - always enabled when face is detected
+        # Use a stable key that doesn't change with target_pose to preserve click state
+        manual_capture_clicked = info_cols[3].button(
+            "📸 Capture",
+            disabled=not face_bytes,
+            help="Manually capture face image for current pose",
+            use_container_width=True,
+            key=f"manual_capture_btn_{username}",
+        )
+        
         status_parts = [
             "Centered" if face_centered else "Not centered",
             "Aligned" if aligned else "Size/guide not ideal",
             "Pose matched" if pose_match else "Pose not matched",
         ]
-        info_cols[3].caption(guide_message)
+        info_cols[4].caption(guide_message)
         st.caption(" | ".join(status_parts))
         if target_pose == "Frontal" and state.get("baseline_yaw") is None:
             st.caption(
                 "Initial calibration is based on your frontal capture. Hold a centered, straight pose."
             )
 
-        if state["stable_counter"] >= self.STABLE_POLLS_REQUIRED:
+        # Handle manual capture button click
+        manual_capture_success = False
+        if manual_capture_clicked and face_bytes:
+            # Save the face sample for the current target pose
+            ok, message = self.service.save_face_samples(
+                username,
+                [
+                    {
+                        "face_image": face_bytes,
+                        "pose": target_pose,
+                        "lighting": "",
+                        "glasses": False,
+                    }
+                ],
+            )
+            state["status_message"] = message
+            state["stable_counter"] = 0
+            if ok:
+                state["captured_samples"][target_pose] = face_bytes
+                if target_pose == "Frontal" and vertical_ratio is not None:
+                    state["baseline_vertical_ratio"] = vertical_ratio
+                if target_pose == "Frontal" and yaw_value is not None:
+                    state["baseline_yaw"] = yaw_value
+                if target_pose == "Frontal" and pitch_value is not None:
+                    state["baseline_pitch"] = pitch_value
+                st.success(f"✓ Captured {target_pose} pose!")
+                manual_capture_success = True
+                st.rerun()
+            else:
+                st.error(f"Failed to capture: {message}")
+
+        # Auto-capture only if manual capture didn't just happen
+        if not manual_capture_success and state["stable_counter"] >= self.STABLE_POLLS_REQUIRED:
             ok, message = self.service.save_face_samples(
                 username,
                 [

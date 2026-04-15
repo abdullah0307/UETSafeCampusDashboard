@@ -10,7 +10,8 @@ from anpr.app import ANPRDashboardApp
 from attendance.app import AttendanceApp
 from lab_survelliance.app import LabSurveillanceApp
 from classroom_survelliance.app import ClassroomSurveillanceApp
-from utils.app_config import get_application_config
+from utils.app_config import get_application_config, load_app_config
+from utils.db_initializer import initialize_all_databases
 from utils.theme_reset import clear_persisted_theme_once
 
 
@@ -152,6 +153,11 @@ class SafeCampusLauncher:
     def run(self):
         st.set_page_config(layout="wide")
         clear_persisted_theme_once()
+        
+        # Initialize all required databases
+        config = load_app_config()
+        db_results = initialize_all_databases(config)
+        
         st.markdown(
             """
             <style>
