@@ -1376,6 +1376,26 @@ def _load_mediapipe_face_mesh():
     return _create_mediapipe_face_mesh()
 
 
+@st.cache_resource(show_spinner=False)
+def _has_mediapipe_face_mesh_support():
+    if mp is None:
+        return False
+
+    solutions = getattr(mp, "solutions", None)
+    face_mesh_mod = (
+        getattr(solutions, "face_mesh", None) if solutions is not None else None
+    )
+    if face_mesh_mod is not None and hasattr(face_mesh_mod, "FaceMesh"):
+        return True
+
+    try:
+        from mediapipe.python.solutions import face_mesh as mp_face_mesh  # type: ignore
+
+        return hasattr(mp_face_mesh, "FaceMesh")
+    except Exception:
+        return False
+
+
 def _estimate_head_pose_from_face_mesh(landmarks, img_w: int, img_h: int):
     settings = _face_registration_settings()
     # Landmark ids from MediaPipe Face Mesh.
@@ -1511,13 +1531,14 @@ def _estimate_head_angles_from_mesh(landmarks, img_w: int, img_h: int):
         flags=cv2.SOLVEPNP_EPNP,
     )
     if not ok:
-        return None, None, vertical_ratio
+        return None, None, None, vertical_ratio
 
     R, _ = cv2.Rodrigues(rvec)
     sy = np.sqrt(R[0, 0] ** 2 + R[1, 0] ** 2)
     yaw = np.degrees(np.arctan2(-R[2, 0], sy))
     pitch = np.degrees(np.arctan2(R[2, 1], R[2, 2]))
-    return float(yaw), float(pitch), vertical_ratio
+    roll = np.degrees(np.arctan2(R[1, 0], R[0, 0]))
+    return float(yaw), float(pitch), float(roll), vertical_ratio
 
 
 def _classify_direction_from_angles(
@@ -1646,6 +1667,7 @@ class ThreadedFaceCaptureProcessor(VideoProcessorBase):
             "current_direction": "No Face",
             "yaw": None,
             "pitch": None,
+            "roll": None,
             "face_bytes": None,
             "face_preview": None,
             "vertical_ratio": None,
@@ -1653,6 +1675,8 @@ class ThreadedFaceCaptureProcessor(VideoProcessorBase):
             "face_centered": False,
             "guide_message": "Waiting for face detection.",
             "error": "",
+            "startup_status": "Preparing face model...",
+            "model_ready": False,
         }
         self._target_pose = "Frontal"
         self._baseline_vertical_ratio = None
@@ -1665,7 +1689,8 @@ class ThreadedFaceCaptureProcessor(VideoProcessorBase):
         self._last_yaw = None
         self._last_pitch = None
         self._last_direction = "Forward-Level"
-        self._mesh = _create_mediapipe_face_mesh()
+        self._mesh = None
+        self._mesh_init_attempted = False
         self._worker = threading.Thread(target=self._processing_loop, daemon=True)
         self._worker.start()
 
@@ -1713,6 +1738,7 @@ class ThreadedFaceCaptureProcessor(VideoProcessorBase):
             current_direction = "No Face"
             yaw_value = None
             pitch_value = None
+            roll_value = None
             face_bytes = None
             face_preview = None
             vertical_ratio = None
@@ -1721,18 +1747,30 @@ class ThreadedFaceCaptureProcessor(VideoProcessorBase):
             guide_message = "No face detected. Put your face inside the box."
             error = ""
             bbox = None
+            startup_status = ""
+            model_ready = self._mesh is not None
+
+            if self._mesh is None and not self._mesh_init_attempted:
+                self._mesh_init_attempted = True
+                startup_status = "Loading face detection model. Please wait..."
+                self._mesh = _create_mediapipe_face_mesh()
+                model_ready = self._mesh is not None
 
             if self._mesh is None:
                 error = "MediaPipe Face Mesh is not available."
             else:
+                model_ready = True
+                if not startup_status:
+                    startup_status = "Model ready. Starting camera analysis..."
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 result = self._mesh.process(rgb)
                 if result.multi_face_landmarks:
+                    startup_status = ""
                     settings = _face_registration_settings()
                     self._vote_window = int(settings["pose_vote_window"])
                     self._angle_smooth = float(settings["angle_smooth_factor"])
                     lms = result.multi_face_landmarks[0].landmark
-                    yaw, pitch, vertical_ratio = _estimate_head_angles_from_mesh(
+                    yaw, pitch, roll, vertical_ratio = _estimate_head_angles_from_mesh(
                         lms,
                         frame.shape[1],
                         frame.shape[0],
@@ -1763,6 +1801,7 @@ class ThreadedFaceCaptureProcessor(VideoProcessorBase):
                         self._last_yaw, self._last_pitch = yaw, pitch
                         yaw_value = float(yaw)
                         pitch_value = float(pitch)
+                        roll_value = float(roll) if roll is not None else None
 
                         last_vertical = (
                             self._last_direction.split("-")[1]
@@ -1819,6 +1858,7 @@ class ThreadedFaceCaptureProcessor(VideoProcessorBase):
                         self._last_direction = current_direction
                 else:
                     self._vote_buffer.clear()
+                    startup_status = "Model ready. Looking for a face in the camera..."
 
             text_color = (0, 255, 0) if current_pose == target_pose else (0, 200, 255)
             cv2.putText(
@@ -1860,6 +1900,7 @@ class ThreadedFaceCaptureProcessor(VideoProcessorBase):
                     "current_direction": current_direction,
                     "yaw": yaw_value,
                     "pitch": pitch_value,
+                    "roll": roll_value,
                     "face_bytes": face_bytes,
                     "face_preview": face_preview,
                     "vertical_ratio": vertical_ratio,
@@ -1867,6 +1908,8 @@ class ThreadedFaceCaptureProcessor(VideoProcessorBase):
                     "face_centered": face_centered,
                     "guide_message": guide_message,
                     "error": error,
+                    "startup_status": startup_status,
+                    "model_ready": model_ready,
                 }
 
     def recv(self, frame):
@@ -1895,41 +1938,50 @@ class SurveillanceRepository:
         self.face_db = face_db_path
         self.activity_db = activity_db_path
 
-    def _ensure_users_schema(self, conn: sqlite3.Connection):
+    def _ensure_face_samples_schema(self, conn: sqlite3.Connection):
         cursor = conn.cursor()
         cursor.execute(
-            "CREATE TABLE IF NOT EXISTS users ("
-            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
-            "username TEXT UNIQUE, "
-            "embedding BLOB)"
-        )
-        cursor.execute("PRAGMA table_info(users)")
-        cols = {c[1] for c in cursor.fetchall()}
-        if "created_at" not in cols:
-            cursor.execute("ALTER TABLE users ADD COLUMN created_at TEXT")
-            cursor.execute(
-                "UPDATE users SET created_at = datetime('now') WHERE created_at IS NULL"
+            """
+            CREATE TABLE IF NOT EXISTS face_samples (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL,
+                face_image BLOB NOT NULL,
+                embedding BLOB,
+                pose TEXT,
+                pitch REAL,
+                yaw REAL,
+                roll REAL,
+                lighting TEXT,
+                glasses INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
-        if "face_image" not in cols:
-            cursor.execute("ALTER TABLE users ADD COLUMN face_image BLOB")
-        cursor.execute(
-            "CREATE TABLE IF NOT EXISTS face_samples ("
-            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
-            "username TEXT NOT NULL, "
-            "face_image BLOB NOT NULL, "
-            "pose TEXT, "
-            "lighting TEXT, "
-            "glasses INTEGER DEFAULT 0, "
-            "created_at TEXT DEFAULT (datetime('now'))"
-            ")"
+            """
         )
+        # Ensure migration columns for face_samples
+        cursor.execute("PRAGMA table_info(face_samples)")
+        cols = {c[1] for c in cursor.fetchall()}
+        if "embedding" not in cols:
+            cursor.execute("ALTER TABLE face_samples ADD COLUMN embedding BLOB")
+        if "pitch" not in cols:
+            cursor.execute("ALTER TABLE face_samples ADD COLUMN pitch REAL")
+        if "yaw" not in cols:
+            cursor.execute("ALTER TABLE face_samples ADD COLUMN yaw REAL")
+        if "roll" not in cols:
+            cursor.execute("ALTER TABLE face_samples ADD COLUMN roll REAL")
+        
         conn.commit()
 
     def get_faces(self):
         with sqlite3.connect(self.face_db) as conn:
-            self._ensure_users_schema(conn)
+            self._ensure_face_samples_schema(conn)
+            # Use DISTINCT on face_samples since users table is gone
+            # We pick the first available face_image for each user as a representative
             return pd.read_sql_query(
-                "SELECT username, created_at, face_image FROM users", conn
+                """
+                SELECT username, MIN(created_at) as created_at, face_image 
+                FROM face_samples 
+                GROUP BY username
+                """, conn
             )
 
     def upsert_face_image(self, username: str, face_image: bytes):
@@ -1941,17 +1993,19 @@ class SurveillanceRepository:
 
         try:
             with sqlite3.connect(self.face_db) as conn:
-                self._ensure_users_schema(conn)
+                self._ensure_face_samples_schema(conn)
+                # Since users table is gone, we add this as a "Frontal" sample if it's meant to be the primary image
+                # or just a generic sample.
                 conn.execute(
-                    "INSERT OR REPLACE INTO users (username, face_image, created_at) "
-                    "VALUES (?, ?, datetime('now'))",
-                    (clean_username, face_image),
+                    "INSERT INTO face_samples (username, face_image, pose, created_at) "
+                    "VALUES (?, ?, ?, datetime('now'))",
+                    (clean_username, face_image, "Frontal"),
                 )
                 conn.commit()
         except sqlite3.Error as exc:
             return False, f"Database error: {exc}"
 
-        return True, f"Face saved for {clean_username}."
+        return True, f"Face sample saved for {clean_username}."
 
     def add_face_samples(self, username: str, samples):
         clean_username = str(username).strip()
@@ -1962,46 +2016,26 @@ class SurveillanceRepository:
 
         try:
             with sqlite3.connect(self.face_db) as conn:
-                self._ensure_users_schema(conn)
+                self._ensure_face_samples_schema(conn)
                 for sample in samples:
                     face_image = sample.get("face_image")
                     if not face_image:
                         continue
                     conn.execute(
-                        "INSERT INTO face_samples (username, face_image, pose, lighting, glasses, created_at) "
-                        "VALUES (?, ?, ?, ?, ?, datetime('now'))",
+                        "INSERT INTO face_samples (username, face_image, embedding, pose, pitch, yaw, roll, lighting, glasses, created_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))",
                         (
                             clean_username,
                             face_image,
+                            sample.get("embedding"),
                             str(sample.get("pose", "")),
+                            sample.get("pitch"),
+                            sample.get("yaw"),
+                            sample.get("roll"),
                             str(sample.get("lighting", "")),
                             int(bool(sample.get("glasses", False))),
                         ),
                     )
-
-                # Keep latest sample mirrored in users.face_image for compatibility.
-                latest_face = samples[-1].get("face_image")
-                if latest_face:
-                    # Check if user exists first
-                    existing_user = conn.execute(
-                        "SELECT 1 FROM users WHERE username = ?",
-                        (clean_username,),
-                    ).fetchone()
-                    
-                    if existing_user:
-                        # User exists, just update face_image
-                        conn.execute(
-                            "UPDATE users SET face_image = ?, created_at = datetime('now') "
-                            "WHERE username = ?",
-                            (latest_face, clean_username),
-                        )
-                    else:
-                        # User doesn't exist, insert with empty embedding
-                        conn.execute(
-                            "INSERT INTO users (username, face_image, embedding, created_at) "
-                            "VALUES (?, ?, ?, datetime('now'))",
-                            (clean_username, latest_face, b''),
-                        )
                 conn.commit()
         except sqlite3.Error as exc:
             return False, f"Database error: {exc}"
@@ -2010,24 +2044,23 @@ class SurveillanceRepository:
 
     def get_face_sample_counts(self):
         with sqlite3.connect(self.face_db) as conn:
-            self._ensure_users_schema(conn)
+            self._ensure_face_samples_schema(conn)
             return pd.read_sql_query(
                 """
                 SELECT
-                    u.username AS username,
-                    COUNT(s.id) AS sample_count,
-                    MAX(s.created_at) AS last_sample_at
-                FROM users u
-                LEFT JOIN face_samples s ON s.username = u.username
-                GROUP BY u.username
-                ORDER BY COALESCE(MAX(s.created_at), u.created_at) DESC
+                    username,
+                    COUNT(id) AS sample_count,
+                    MAX(created_at) AS last_sample_at
+                FROM face_samples
+                GROUP BY username
+                ORDER BY MAX(created_at) DESC
                 """,
                 conn,
             )
 
     def get_latest_pose_samples(self):
         with sqlite3.connect(self.face_db) as conn:
-            self._ensure_users_schema(conn)
+            self._ensure_face_samples_schema(conn)
             return pd.read_sql_query(
                 """
                 SELECT s.username, s.pose, s.face_image, s.created_at
@@ -2049,11 +2082,10 @@ class SurveillanceRepository:
             return False, "Username is required."
         try:
             with sqlite3.connect(self.face_db) as conn:
-                self._ensure_users_schema(conn)
+                self._ensure_face_samples_schema(conn)
                 conn.execute(
                     "DELETE FROM face_samples WHERE username = ?", (clean_username,)
                 )
-                conn.execute("DELETE FROM users WHERE username = ?", (clean_username,))
                 conn.commit()
         except sqlite3.Error as exc:
             return False, f"Database error: {exc}"
@@ -2071,25 +2103,21 @@ class SurveillanceRepository:
 
         try:
             with sqlite3.connect(self.face_db) as conn:
-                self._ensure_users_schema(conn)
+                self._ensure_face_samples_schema(conn)
                 existing = conn.execute(
-                    "SELECT 1 FROM users WHERE username = ?",
+                    "SELECT 1 FROM face_samples WHERE username = ?",
                     (clean_current,),
                 ).fetchone()
                 if not existing:
                     return False, f"{clean_current} was not found."
 
                 duplicate = conn.execute(
-                    "SELECT 1 FROM users WHERE username = ?",
+                    "SELECT 1 FROM face_samples WHERE username = ?",
                     (clean_new,),
                 ).fetchone()
                 if duplicate:
                     return False, f"{clean_new} already exists."
 
-                conn.execute(
-                    "UPDATE users SET username = ? WHERE username = ?",
-                    (clean_new, clean_current),
-                )
                 conn.execute(
                     "UPDATE face_samples SET username = ? WHERE username = ?",
                     (clean_new, clean_current),
@@ -2577,6 +2605,9 @@ class FaceRegistrationPage(BasePage):
     TARGET_POSES = ["Frontal", "Left Profile", "Right Profile", "Up Tilt", "Down Tilt"]
     STABLE_POLLS_REQUIRED = 2
     REFRESH_INTERVAL_MS = 700
+    GALLERY_COLUMNS = 3
+    MANAGE_FACE_THUMBNAIL_WIDTH = 110
+    MANAGE_FACE_LIST_HEIGHT = 520
 
     def __init__(self, service):
         super().__init__("🧠 Face Registration", service)
@@ -2612,6 +2643,45 @@ class FaceRegistrationPage(BasePage):
         }
         return st.session_state["face_guided_capture_state"]
 
+    @staticmethod
+    def _bump_streamer_revision():
+        st.session_state["face_guided_capture_stream_revision"] = (
+            int(st.session_state.get("face_guided_capture_stream_revision", 0)) + 1
+        )
+
+    @staticmethod
+    def _streamer_key(username: str) -> str:
+        safe_username = "".join(
+            char.lower() if char.isalnum() else "_" for char in username.strip()
+        ).strip("_") or "default"
+        revision = int(st.session_state.get("face_guided_capture_stream_revision", 0))
+        return f"face_guided_capture_webrtc_{safe_username}_{revision}"
+
+    def _render_pose_gallery(self, captured_samples: dict, container_height=None):
+        total = len(self.TARGET_POSES)
+        valid_captured = {
+            pose_name: captured_samples[pose_name]
+            for pose_name in self.TARGET_POSES
+            if pose_name in captured_samples
+        }
+        if container_height is None:
+            gallery_container = st.container()
+        else:
+            gallery_container = st.container(border=True, height=container_height)
+
+        with gallery_container:
+            st.progress(len(valid_captured) / float(total))
+            cols = st.columns(total)
+            for offset, pose_name in enumerate(self.TARGET_POSES):
+                with cols[offset]:
+                    with st.container(border=True):
+                        st.caption(pose_name)
+                        pose_img = valid_captured.get(pose_name)
+                        if pose_img:
+                            st.image(pose_img, width="stretch")
+                        else:
+                            st.caption("Not captured")
+
     def _render_register_view(self):
         st.caption(
             "Client browser camera with threaded pose processing and auto-capture."
@@ -2623,21 +2693,9 @@ class FaceRegistrationPage(BasePage):
             )
             return
 
-        if mp is None or _load_mediapipe_face_mesh() is None:
+        if not _has_mediapipe_face_mesh_support():
             st.error("MediaPipe Face Mesh is not available.")
             return
-
-        # Show diagnostic info for troubleshooting
-        with st.expander("🔧 Camera Diagnostics", expanded=False):
-            st.caption(f"**streamlit-webrtc available:** {webrtc_streamer is not None}")
-            st.caption(f"**WebRtcMode available:** {WebRtcMode is not None}")
-            st.caption(f"**av (PyAV) available:** {av is not None}")
-            st.caption(f"**mediapipe available:** {mp is not None}")
-            try:
-                import streamlit_webrtc
-                st.caption(f"**streamlit-webrtc version:** {streamlit_webrtc.__version__}")
-            except:
-                st.caption("**streamlit-webrtc version:** Unknown")
 
         current_url = str(getattr(st.context, "url", "") or "").strip()
         if not _is_secure_camera_context():
@@ -2656,6 +2714,7 @@ class FaceRegistrationPage(BasePage):
             label="Person Name",
             placeholder="Person Name",
             label_visibility="collapsed",
+            key="face_registration_person_name",
         )
         username = username.strip()
         if not username:
@@ -2663,15 +2722,20 @@ class FaceRegistrationPage(BasePage):
             st.info("Enter a person name, then click Start to open the client camera.")
             return
 
-        state = self._capture_state(username)
-        if state.get("username") != username:
+        state = self._capture_state()
+        previous_username = str(state.get("username", "")).strip()
+        if previous_username != username:
             state = self._reset_capture_state(username)
             state["ignore_saved_samples"] = False
+            self._bump_streamer_revision()
+            st.rerun()
 
         pose_samples_df = self.service.get_latest_pose_samples()
         reset_requested = top_cols[1].button("Reset Capture", width="stretch")
         if reset_requested:
             state = self._reset_capture_state(username)
+            self._bump_streamer_revision()
+            st.rerun()
 
         if not pose_samples_df.empty and not state.get("ignore_saved_samples", False):
             rows = pose_samples_df[
@@ -2680,7 +2744,11 @@ class FaceRegistrationPage(BasePage):
             for _, row in rows.iterrows():
                 pose = str(row.get("pose", "")).strip()
                 image = row.get("face_image")
-                if pose and isinstance(image, (bytes, bytearray)) and image:
+                if (
+                    pose in self.TARGET_POSES
+                    and isinstance(image, (bytes, bytearray))
+                    and image
+                ):
                     # Only load from DB if not already captured in current session
                     if pose not in state["captured_samples"]:
                         state["captured_samples"][pose] = image
@@ -2693,13 +2761,13 @@ class FaceRegistrationPage(BasePage):
         st.markdown(
             """
             <style>
-            .st-key-face_guided_capture_webrtc video,
-            .st-key-face_guided_capture_webrtc canvas {
-                width: 720px !important;
+            [class*="st-key-face_guided_capture_webrtc_"] video,
+            [class*="st-key-face_guided_capture_webrtc_"] canvas {
+                width: 100% !important;
                 max-width: 100% !important;
-                height: 640px !important;
-                max-height: 640px !important;
-                object-fit: cover;
+                height: min(42vh, 360px) !important;
+                max-height: 360px !important;
+                object-fit: contain;
                 border-radius: 10px;
                 background: #020617;
             }
@@ -2708,28 +2776,33 @@ class FaceRegistrationPage(BasePage):
             unsafe_allow_html=True,
         )
 
-        stream_col, crop_col = st.columns([2.4, 1.2])
-        # Browser-to-app capture works with host ICE candidates here; avoiding
-        # external STUN also prevents background retries during teardown.
-        # Add fallback ICE servers for better connectivity
-        rtc_config = {
-            "iceServers": [
-                {"urls": "stun:stun.l.google.com:19302"},
-                {"urls": "stun:stun1.l.google.com:19302"},
-            ]
-        }
         should_stream = target_pose != "Done"
+        if not should_stream:
+            st.success("Face captured successfully. Camera closed.")
+            if state.get("status_message"):
+                st.caption(state["status_message"])
+            with st.container(border=True):
+                st.caption("Captured Faces")
+                self._render_pose_gallery(
+                    state["captured_samples"], container_height=420
+                )
+            return
+
+        stream_col, crop_col = st.columns([1.7, 1.3])
+        # For same-device or same-LAN usage, host ICE candidates start faster
+        # than waiting on external STUN resolution.
+        rtc_config = {"iceServers": []}
         with stream_col:
             with st.container(border=True):
                 st.caption("Live Input Stream")
                 try:
                     ctx = webrtc_streamer(
-                        key="face_guided_capture_webrtc",
+                        key=self._streamer_key(username),
                         mode=WebRtcMode.SENDRECV,
                         media_stream_constraints={
                             "video": {
-                                "width": {"ideal": 720},
-                                "height": {"ideal": 640},
+                                "width": {"ideal": 640},
+                                "height": {"ideal": 360},
                                 "facingMode": "user",
                             },
                             "audio": False,
@@ -2747,23 +2820,6 @@ class FaceRegistrationPage(BasePage):
         stream_error = ""
         if ctx is not None and hasattr(ctx, "state") and hasattr(ctx.state, "signalling"):
             stream_error = str(getattr(ctx.state, "signalling", "") or "").strip()
-
-        if not should_stream:
-            st.success("Face captured successfully. Camera closed.")
-            if state.get("status_message"):
-                st.caption(state["status_message"])
-            with st.container(border=True, height=485):
-                st.progress(
-                    len(state["captured_samples"]) / float(len(self.TARGET_POSES))
-                )
-                for pose_name in self.TARGET_POSES:
-                    st.caption(pose_name)
-                    pose_img = state["captured_samples"].get(pose_name)
-                    if pose_img:
-                        st.image(pose_img, width="stretch")
-                    else:
-                        st.caption("Not captured")
-            return
 
         if "navigator.mediadevices is undefined" in stream_error.lower():
             st.error(
@@ -2794,7 +2850,7 @@ class FaceRegistrationPage(BasePage):
 
         processor = ctx.video_processor
         if processor is None:
-            st.info("Waiting for camera stream to initialize.")
+            st.info("Starting camera stream. Please wait...")
             return
 
         processor.update_guidance(
@@ -2807,6 +2863,9 @@ class FaceRegistrationPage(BasePage):
         if live_state.get("error"):
             st.error(live_state["error"])
             return
+        startup_status = str(live_state.get("startup_status", "") or "").strip()
+        if startup_status:
+            st.info(startup_status)
 
         current_pose = live_state.get("current_pose", "No Face")
         current_direction = live_state.get("current_direction", "No Face")
@@ -2865,6 +2924,9 @@ class FaceRegistrationPage(BasePage):
                     {
                         "face_image": face_bytes,
                         "pose": target_pose,
+                        "pitch": pitch_value,
+                        "yaw": yaw_value,
+                        "roll": live_state.get("roll"),
                         "lighting": "",
                         "glasses": False,
                     }
@@ -2894,6 +2956,9 @@ class FaceRegistrationPage(BasePage):
                     {
                         "face_image": face_bytes,
                         "pose": target_pose,
+                        "pitch": pitch_value,
+                        "yaw": yaw_value,
+                        "roll": live_state.get("roll"),
                         "lighting": "",
                         "glasses": False,
                     }
@@ -2916,19 +2981,8 @@ class FaceRegistrationPage(BasePage):
 
         with crop_col:
             with st.container(border=True):
-                pass
-
-        st.progress(len(state["captured_samples"]) / float(len(self.TARGET_POSES)))
-        st.markdown("#### Captured Faces")
-        cols = st.columns(len(self.TARGET_POSES))
-        for i, pose_name in enumerate(self.TARGET_POSES):
-            with cols[i]:
-                st.caption(pose_name)
-                pose_img = state["captured_samples"].get(pose_name)
-                if pose_img:
-                    st.image(pose_img, width="stretch")
-                else:
-                    st.caption("Not captured")
+                st.caption("Captured Faces")
+                self._render_pose_gallery(state["captured_samples"])
 
     def _render_manage_view(self):
         st.caption("Search, edit, and delete saved faces.")
@@ -2988,37 +3042,42 @@ class FaceRegistrationPage(BasePage):
                     continue
                 pose_map.setdefault(uname, {})[pose] = img_blob
 
-        for _, row in preview_df.iterrows():
-            username = str(row.get("username", "Unknown"))
-            info_col, poses_col, action_col = st.columns([1.7, 5.3, 1.4])
-            with info_col:
-                st.markdown(f"**{username}**")
-                st.caption(f"Saved: {row.get('created_at', '-')}")
-                st.caption(f"Samples: {int(row.get('sample_count', 0))}")
-            with poses_col:
-                user_pose_samples = pose_map.get(username, {})
-                p_cols = st.columns(5)
-                for i, pose_name in enumerate(pose_order):
-                    with p_cols[i]:
-                        st.caption(pose_name)
-                        pose_img = user_pose_samples.get(pose_name)
-                        if isinstance(pose_img, (bytes, bytearray)) and pose_img:
-                            st.image(pose_img, width="stretch")
-                        else:
-                            st.caption("Not captured")
-            with action_col:
-                if st.button("Edit Name", key=f"edit_face_{username}", width="stretch"):
-                    st.session_state["face_name_edit_target"] = username
-                    st.rerun()
-                if st.button("Delete", key=f"delete_face_{username}", width="stretch"):
-                    ok, message = self.service.delete_face(username)
-                    if ok:
-                        st.session_state["face_manage_status_message"] = message
-                        st.session_state["face_manage_status_level"] = "success"
+        with st.container(border=True, height=self.MANAGE_FACE_LIST_HEIGHT):
+            for _, row in preview_df.iterrows():
+                username = str(row.get("username", "Unknown"))
+                info_col, poses_col, action_col = st.columns([1.7, 5.3, 1.4])
+                with info_col:
+                    st.markdown(f"**{username}**")
+                    st.caption(f"Saved: {row.get('created_at', '-')}")
+                    st.caption(f"Samples: {int(row.get('sample_count', 0))}")
+                with poses_col:
+                    user_pose_samples = pose_map.get(username, {})
+                    p_cols = st.columns(len(pose_order))
+                    for offset, pose_name in enumerate(pose_order):
+                        with p_cols[offset]:
+                            with st.container(border=True):
+                                st.caption(pose_name)
+                                pose_img = user_pose_samples.get(pose_name)
+                                if isinstance(pose_img, (bytes, bytearray)) and pose_img:
+                                    st.image(
+                                        pose_img,
+                                        width=self.MANAGE_FACE_THUMBNAIL_WIDTH,
+                                    )
+                                else:
+                                    st.caption("Not captured")
+                with action_col:
+                    if st.button("Edit Name", key=f"edit_face_{username}", width="stretch"):
+                        st.session_state["face_name_edit_target"] = username
                         st.rerun()
-                    else:
-                        st.error(message)
-            st.divider()
+                    if st.button("Delete", key=f"delete_face_{username}", width="stretch"):
+                        ok, message = self.service.delete_face(username)
+                        if ok:
+                            st.session_state["face_manage_status_message"] = message
+                            st.session_state["face_manage_status_level"] = "success"
+                            st.rerun()
+                        else:
+                            st.error(message)
+                st.divider()
 
         edit_target = st.session_state.get("face_name_edit_target")
         if edit_target:
@@ -4219,6 +4278,7 @@ class LiveCameraPage(BasePage):
     )
     SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
     AUTO_REFRESH_SECONDS = 1
+    STALE_AFTER_SECONDS = 10
 
     def __init__(self, service):
         super().__init__("📷 Live Camera Snapshot", service)
@@ -4234,6 +4294,16 @@ class LiveCameraPage(BasePage):
             if path.is_file() and path.suffix.lower() in self.SUPPORTED_EXTENSIONS
         ]
         return sorted(files, key=lambda p: p.stat().st_mtime, reverse=True)
+
+    @staticmethod
+    def _seconds_since_update(path: Path):
+        return max(time.time() - path.stat().st_mtime, 0.0)
+
+    def _is_live_image(self, path: Path):
+        try:
+            return self._seconds_since_update(path) <= float(self.STALE_AFTER_SECONDS)
+        except FileNotFoundError:
+            return False
 
     @staticmethod
     def _format_timestamp(path: Path):
@@ -4269,15 +4339,20 @@ class LiveCameraPage(BasePage):
                 interval=self.AUTO_REFRESH_SECONDS * 1000, key="lab_live_camera_refresh"
             )
 
-        images = self._available_images()
+        images = [path for path in self._available_images() if self._is_live_image(path)]
         if not images:
-            st.error(f"No camera snapshots found in: {self.LIVE_IMAGE_DIR}")
+            st.info("No live camera streams are currently active.")
+            st.caption(
+                f"Frames older than {self.STALE_AFTER_SECONDS} seconds are hidden."
+            )
             return
 
         # Default to live_latest.jpg when present, otherwise the most recent file.
         default_image = (
             self.LIVE_IMAGE_PATH
-            if self.LIVE_IMAGE_PATH is not None and self.LIVE_IMAGE_PATH.exists()
+            if self.LIVE_IMAGE_PATH is not None
+            and self.LIVE_IMAGE_PATH.exists()
+            and self._is_live_image(self.LIVE_IMAGE_PATH)
             else images[0]
         )
         default_index = images.index(default_image) if default_image in images else 0
@@ -4291,6 +4366,9 @@ class LiveCameraPage(BasePage):
         )
 
         st.caption(f"Last updated: {self._format_timestamp(selected_image)}")
+        st.caption(
+            f"Live status: active within the last {self.STALE_AFTER_SECONDS} seconds"
+        )
         frame = self._load_frame(selected_image)
         if frame is None:
             st.info("Frame loading...")

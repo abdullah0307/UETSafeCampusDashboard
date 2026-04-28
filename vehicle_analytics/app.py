@@ -1,15 +1,15 @@
 import streamlit as st
 
-from anpr.utils import ConfigManager, DatabaseManager, PlateLogRepository, DashboardService, \
+from vehicle_analytics.utils import ConfigManager, DatabaseManager, PlateLogRepository, DashboardService, \
     RegisteredVehicleRepository, LiveMonitorPage, AnalyticsPage, VehicleSearchPage, CampusTimeTrackerPage, \
     RegisterVehiclePage
 from utils.app_config import get_application_config
 from utils.theme_reset import clear_persisted_theme_once
 
 
-class ANPRDashboardApp:
+class VehicleAnalyticsDashboardApp:
     def __init__(self):
-        config = ConfigManager(get_application_config("anpr"))
+        config = ConfigManager(get_application_config("vehicle_analytics"))
         db_manager = DatabaseManager(config.db_path)
 
         plate_repo = PlateLogRepository(db_manager)
@@ -17,7 +17,13 @@ class ANPRDashboardApp:
         service = DashboardService(plate_repo, vehicle_repo)
 
         self.pages = {
-            "📡 Live Camera View": LiveMonitorPage(plate_repo),
+            "📡 Live Camera View": LiveMonitorPage(
+                plate_repo,
+                live_frames_dir=config.live_frames_dir,
+                stream_source_mode=config.stream_source_mode,
+                streams_api_url=config.streams_api_url,
+                streams_public_base_url=config.streams_public_base_url,
+            ),
             "📊 Reports & Insights": AnalyticsPage(service),
             "🔍 Search Vehicles": VehicleSearchPage(service),
             "⏱️ Time Spent on Campus": CampusTimeTrackerPage(service),
@@ -33,4 +39,4 @@ class ANPRDashboardApp:
 
 
 if __name__ == "__main__":
-    ANPRDashboardApp().run()
+    VehicleAnalyticsDashboardApp().run()

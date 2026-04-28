@@ -139,6 +139,44 @@ def _attach_activity_screenshot_paths(df: pd.DataFrame) -> pd.Series:
     return pd.Series(screenshot_paths, index=df.index)
 
 
+def _resolve_classroom_screenshot_paths(df: pd.DataFrame) -> pd.Series:
+    if df.empty:
+        return pd.Series(dtype="object")
+
+    resolved_paths = []
+    activity_fallback = _attach_activity_screenshot_paths(df)
+
+    for idx, row in df.iterrows():
+        best_path = ""
+        for key in ("frame_image_path", "crop_image_path"):
+            value = str(row.get(key, "") or "").strip()
+            if value and Path(value).is_file():
+                best_path = value
+                break
+
+        if not best_path:
+            best_path = str(activity_fallback.get(idx, "") or "").strip()
+
+        resolved_paths.append(best_path)
+
+    return pd.Series(resolved_paths, index=df.index)
+
+
+def _resolve_classroom_crop_paths(df: pd.DataFrame) -> pd.Series:
+    if df.empty:
+        return pd.Series(dtype="object")
+
+    resolved_paths = []
+    for _, row in df.iterrows():
+        best_path = ""
+        value = str(row.get("crop_image_path", "") or "").strip()
+        if value and Path(value).is_file():
+            best_path = value
+        resolved_paths.append(best_path)
+
+    return pd.Series(resolved_paths, index=df.index)
+
+
 @st.cache_data(ttl=30, show_spinner=False)
 def _thumbnail_data_uri(image_path: str, max_side: int = 140) -> str:
     if not image_path:
@@ -212,6 +250,21 @@ def _source_image_data_uri(image_path: str) -> str:
         ".bmp": "image/bmp",
     }.get(suffix, "application/octet-stream")
     return f"data:{mime_type};base64," + base64.b64encode(image_bytes).decode("ascii")
+
+
+def _prepare_classroom_table_assets(logs_df: pd.DataFrame) -> pd.DataFrame:
+    """Attach image assets only for rows that will actually be rendered in the table."""
+    if logs_df.empty:
+        return logs_df
+
+    table_df = logs_df.copy()
+    table_df["screenshot_path"] = _resolve_classroom_screenshot_paths(table_df)
+    table_df["crop_path"] = _resolve_classroom_crop_paths(table_df)
+    table_df["screenshot_thumb"] = table_df["screenshot_path"].apply(lambda p: _thumbnail_data_uri(p, max_side=300))
+    table_df["screenshot_full"] = table_df["screenshot_path"].apply(_source_image_data_uri)
+    table_df["crop_thumb"] = table_df["crop_path"].apply(lambda p: _thumbnail_data_uri(p, max_side=300))
+    table_df["crop_full"] = table_df["crop_path"].apply(_source_image_data_uri)
+    return table_df
 
 
 def _render_clickable_image_preview(
@@ -426,7 +479,8 @@ class ClassroomLiveStreamPage(LiveCameraPage):
             return []
 
         cards = []
-        for status_path in sorted(self.STATUS_DIR.glob("stream_*_status.json")):
+        # Support both stream_*_status.json and *_status.json patterns
+        for status_path in sorted(self.STATUS_DIR.glob("*_status.json")):
             stream_slug = status_path.stem.replace("_status", "")
             frame_path = self.LIVE_IMAGE_DIR / f"{stream_slug}_latest_frame.jpg"
             payload = {}
@@ -1150,8 +1204,32 @@ class ClassroomStudentsLogsPage:
             head_direction = html.escape(str(row["head_direction"]))
             attention_ratio = f"{float(row['attention_ratio']) * 100:.1f}%"
             thumb_src = str(row.get("screenshot_thumb") or "").strip()
-            image_cell = f'<img src="{thumb_src}" class="shot-thumb" alt="Screenshot" />' if thumb_src else '<div class="shot-empty">No image</div>'
-            rows_html.append(f"<tr><td>{timestamp}</td><td>{stream}</td><td>{student}</td><td>{attention_state}</td><td>{activity}</td><td>{head_direction}</td><td>{attention_ratio}</td><td>{image_cell}</td></tr>")
+            full_src = str(row.get("screenshot_full") or thumb_src).strip()
+            crop_thumb_src = str(row.get("crop_thumb") or "").strip()
+            crop_full_src = str(row.get("crop_full") or crop_thumb_src).strip()
+            screenshot_title = html.escape(f"{student} | {activity} | Scene | {timestamp}")
+            crop_title = html.escape(f"{student} | {activity} | Person Crop | {timestamp}")
+            image_cell = (
+                f"""
+                <button type="button" class="shot-button" onclick="openShotModal('{full_src}', '{screenshot_title}')">
+                  <img src="{thumb_src}" class="shot-thumb" alt="{screenshot_title}" />
+                  <span class="shot-overlay">Click for full view</span>
+                </button>
+                """
+                if thumb_src
+                else '<div class="shot-empty">No image</div>'
+            )
+            crop_cell = (
+                f"""
+                <button type="button" class="shot-button" onclick="openShotModal('{crop_full_src}', '{crop_title}')">
+                  <img src="{crop_thumb_src}" class="shot-thumb shot-thumb--crop" alt="{crop_title}" />
+                  <span class="shot-overlay">Click for full view</span>
+                </button>
+                """
+                if crop_thumb_src
+                else '<div class="shot-empty">No crop</div>'
+            )
+            rows_html.append(f"<tr><td>{timestamp}</td><td>{stream}</td><td>{student}</td><td>{attention_state}</td><td>{activity}</td><td>{head_direction}</td><td>{attention_ratio}</td><td>{image_cell}</td><td>{crop_cell}</td></tr>")
 
         table_html = f"""
         <style>
@@ -1160,72 +1238,109 @@ class ClassroomStudentsLogsPage:
           .student-logs-table thead th {{ position: sticky; top: 0; z-index: 2; background: #111827; color: #e5e7eb; text-align: left; padding: 14px 12px; border-bottom: 1px solid rgba(148, 163, 184, 0.35); }}
           .student-logs-table td {{ color: #d1d5db; padding: 14px 12px; border-bottom: 1px solid rgba(148, 163, 184, 0.2); }}
           .student-logs-table tbody tr:hover {{ background: rgba(30, 41, 59, 0.45); }}
+          .shot-button {{ position: relative; display: inline-flex; padding: 0; border: none; background: transparent; border-radius: 8px; overflow: hidden; cursor: pointer; }}
           .shot-thumb {{ width: 220px; height: 160px; object-fit: contain; background: rgba(2, 6, 23, 0.55); display: block; border-radius: 8px; border: 1px solid rgba(148, 163, 184, 0.4); }}
+          .shot-thumb--crop {{ object-fit: cover; }}
+          .shot-overlay {{ position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; background: rgba(2, 6, 23, 0.68); color: #e5e7eb; font-size: 14px; font-weight: 700; opacity: 0; transition: opacity 0.18s ease; }}
+          .shot-button:hover .shot-overlay {{ opacity: 1; }}
           .shot-empty {{ width: 220px; height: 160px; display: flex; align-items: center; justify-content: center; border-radius: 8px; border: 1px dashed rgba(148, 163, 184, 0.35); color: #9ca3af; font-size: 14px; }}
+          .shot-modal {{ position: fixed; inset: 0; display: none; align-items: center; justify-content: center; background: rgba(2, 6, 23, 0.96); z-index: 9999; padding: 12px; box-sizing: border-box; }}
+          .shot-modal.is-open {{ display: flex; }}
+          .shot-modal__content {{ width: 100%; height: 100%; display: flex; flex-direction: column; gap: 14px; }}
+          .shot-modal__topbar {{ display: flex; align-items: center; justify-content: space-between; gap: 12px; }}
+          .shot-modal__title {{ color: #e5e7eb; font-size: 24px; font-weight: 700; }}
+          .shot-modal__close {{ border: 1px solid rgba(148, 163, 184, 0.35); background: rgba(15, 23, 42, 0.88); color: #e5e7eb; border-radius: 10px; padding: 12px 20px; font-size: 16px; font-weight: 700; cursor: pointer; }}
+          .shot-modal__viewport {{ flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; overflow: auto; border-radius: 12px; border: 1px solid rgba(148, 163, 184, 0.2); background: rgba(15, 23, 42, 0.45); }}
+          .shot-modal__img {{ max-width: 98vw; max-height: calc(100vh - 110px); object-fit: contain; display: block; }}
         </style>
         <div class="student-logs-wrap"><table class="student-logs-table">
-          <thead><tr><th>Timestamp</th><th>Stream</th><th>Student</th><th>Attention State</th><th>Activity</th><th>Head Direction</th><th>Attention Ratio</th><th>Screenshot</th></tr></thead>
+          <thead><tr><th>Timestamp</th><th>Stream</th><th>Student</th><th>Attention State</th><th>Activity</th><th>Head Direction</th><th>Attention Ratio</th><th>Screenshot</th><th>Person Crop</th></tr></thead>
           <tbody>{"".join(rows_html)}</tbody>
-        </table></div>"""
+        </table></div>
+        <div id="shot-modal" class="shot-modal" onclick="closeShotModal(event)">
+          <div class="shot-modal__content">
+            <div class="shot-modal__topbar">
+              <div id="shot-modal-title" class="shot-modal__title">Screenshot Preview</div>
+              <button type="button" class="shot-modal__close" onclick="closeShotModal(event)">Back</button>
+            </div>
+            <div class="shot-modal__viewport">
+              <img id="shot-modal-img" class="shot-modal__img" src="" alt="Screenshot Preview" />
+            </div>
+          </div>
+        </div>
+        <script>
+          function openShotModal(src, title) {{
+            var modal = document.getElementById("shot-modal");
+            var img = document.getElementById("shot-modal-img");
+            var titleNode = document.getElementById("shot-modal-title");
+            if (!modal || !img || !src) return;
+            img.src = src;
+            img.alt = title || "Screenshot Preview";
+            if (titleNode) titleNode.textContent = title || "Screenshot Preview";
+            modal.classList.add("is-open");
+            document.body.style.overflow = "hidden";
+          }}
+          function closeShotModal(event) {{
+            if (event) {{
+              event.preventDefault();
+              event.stopPropagation();
+              if (event.target && event.target.id !== "shot-modal" && !event.target.classList.contains("shot-modal__close")) {{
+                return;
+              }}
+            }}
+            var modal = document.getElementById("shot-modal");
+            var img = document.getElementById("shot-modal-img");
+            if (!modal || !img) return;
+            modal.classList.remove("is-open");
+            img.src = "";
+            document.body.style.overflow = "";
+          }}
+          document.addEventListener("keydown", function(event) {{
+            if (event.key === "Escape") {{
+              closeShotModal();
+            }}
+          }});
+        </script>"""
         components.html(table_html, height=850)
         st.download_button("⬇ Download CSV", logs_df.to_csv(index=False).encode("utf-8"), "classroom_student_logs.csv", key="classroom_logs_download")
 
     def render(self):
         self.show_title()
         
-        # Get total count for pagination
         total_count = self.service.get_logs_count()
-        
-        # Create paginator
-        paginator = PaginationManager('classroom_logs', total_count, default_per_page=50)
-        
-        # Load paginated data
-        logs_df = _classroom_prepare_logs(self.service.get_logs(page=paginator.current_page, per_page=paginator.per_page))
+        logs_df = _classroom_prepare_logs(self.service.get_logs(page=1, per_page=max(total_count, 1)))
 
         if logs_df.empty:
             st.info("No classroom student logs are available yet.")
             return
 
         logs_df = logs_df.sort_values("timestamp", ascending=False).reset_index(drop=True)
-        logs_df["screenshot_path"] = _attach_activity_screenshot_paths(logs_df)
-        logs_df["screenshot_thumb"] = logs_df["screenshot_path"].apply(lambda p: _thumbnail_data_uri(p, max_side=300))
 
         stream_options = ["All Streams"] + sorted(logs_df["stream_label"].dropna().unique())
-        state_options = ["All States", "Attentive", "Inattentive"]
         student_options = ["All Students"] + sorted(logs_df["student_label"].dropna().unique())
+        min_date = logs_df["timestamp"].min().date()
+        max_date = logs_df["timestamp"].max().date()
+        default_date = min(max(pd.Timestamp.now().date(), min_date), max_date)
+        activity_options = ["All Activities"] + sorted(logs_df["activity_label"].dropna().unique())
 
         # All filters in a single row
-        f1, f2, f3, f4, f5, f6, f7, f8 = st.columns(8)
+        f1, f2, f3, f4, f5, f6 = st.columns(6)
         with f1:
             selected_stream = st.selectbox("Stream", stream_options)
         with f2:
-            selected_state = st.selectbox("State", state_options)
-        with f3:
             selected_student = st.selectbox("Student", student_options)
-        
-        min_date = logs_df["timestamp"].min().date()
-        max_date = logs_df["timestamp"].max().date()
+        with f3:
+            start_date = st.date_input("From", value=default_date, min_value=min_date, max_value=max_date, key="table_filter_start_date")
         with f4:
-            start_date = st.date_input("From", value=min_date, min_value=min_date, max_value=max_date, key="table_filter_start_date")
+            end_date = st.date_input("To", value=default_date, min_value=min_date, max_value=max_date, key="table_filter_end_date")
         with f5:
-            end_date = st.date_input("To", value=max_date, min_value=min_date, max_value=max_date, key="table_filter_end_date")
-        
-        activity_options = ["All Activities"] + sorted(logs_df["activity_label"].dropna().unique())
-        with f6:
             selected_activity = st.selectbox("Activity", activity_options, key="table_filter_activity")
-        
-        head_options = ["All Directions"] + sorted(logs_df["head_direction"].dropna().unique())
-        with f7:
-            selected_head = st.selectbox("Head", head_options, key="table_filter_head")
-        
-        with f8:
+        with f6:
             min_attention = st.number_input("Min Att. %", min_value=0.0, max_value=100.0, value=0.0, step=10.0, key="table_filter_min_attention")
 
         filtered_df = logs_df.copy()
         if selected_stream != "All Streams":
             filtered_df = filtered_df[filtered_df["stream_label"] == selected_stream]
-        if selected_state != "All States":
-            filtered_df = filtered_df[filtered_df["attention_state"] == selected_state]
         if selected_student != "All Students":
             filtered_df = filtered_df[filtered_df["student_label"] == selected_student]
 
@@ -1241,8 +1356,6 @@ class ClassroomStudentsLogsPage:
         
         if selected_activity != "All Activities":
             final_filtered_df = final_filtered_df[final_filtered_df["activity_label"] == selected_activity]
-        if selected_head != "All Directions":
-            final_filtered_df = final_filtered_df[final_filtered_df["head_direction"] == selected_head]
         final_filtered_df = final_filtered_df[(final_filtered_df["attention_ratio"] * 100 >= min_attention)]
         
         if final_filtered_df.empty:
@@ -1252,6 +1365,11 @@ class ClassroomStudentsLogsPage:
                 st.info("No data to display.")
             return
 
+        paginator = PaginationManager("classroom_logs", len(final_filtered_df), default_per_page=50)
+        paginator.current_page = paginator.current_page
+        table_df = final_filtered_df.iloc[paginator.offset:paginator.offset + paginator.per_page].reset_index(drop=True)
+        table_df = _prepare_classroom_table_assets(table_df)
+
         st.caption(f"Showing {len(final_filtered_df)} record(s) after all filters.")
 
         tab1, tab2 = st.tabs(["📈 Student Timeline & Analytics", "📋 Activity Logs Table"])
@@ -1260,11 +1378,9 @@ class ClassroomStudentsLogsPage:
             self._render_student_timeline(final_filtered_df, selected_student)
         with tab2:
             st.markdown("### Detailed Activity Records")
-            self._render_activity_table(final_filtered_df)
-        
-        # Pagination controls AFTER the table
-        if paginator.render_pagination_controls():
-            st.rerun()
+            self._render_activity_table(table_df)
+            if paginator.render_pagination_controls():
+                st.rerun()
 
 
 class ClassroomSurveillanceApp:

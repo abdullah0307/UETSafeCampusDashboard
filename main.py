@@ -6,8 +6,8 @@ try:
 except ImportError:
     click_detector = None
 
-from anpr.app import ANPRDashboardApp
-from attendance.app import AttendanceApp
+from vehicle_analytics.app import VehicleAnalyticsDashboardApp
+from attendance_monitoring.app import AttendanceApp
 from lab_survelliance.app import LabSurveillanceApp
 from classroom_survelliance.app import ClassroomSurveillanceApp
 from utils.app_config import get_application_config, load_app_config
@@ -19,16 +19,16 @@ class SafeCampusLauncher:
 
     def __init__(self):
         self.app_configs = {
-            "ANPR": get_application_config("anpr"),
+            "Vehicle Analytics": get_application_config("vehicle_analytics"),
             "Lab Surveillance": get_application_config("lab_surveillance"),
             "Classroom Surveillance": get_application_config("classroom_surveillance"),
-            "Walk Through Attendance": get_application_config("attendance"),
+            "Attendance Management": get_application_config("attendance_monitoring"),
         }
         self.projects = {
-            "ANPR": ANPRDashboardApp(),
+            "Vehicle Analytics": VehicleAnalyticsDashboardApp(),
             "Lab Surveillance": LabSurveillanceApp(),
             "Classroom Surveillance": ClassroomSurveillanceApp(),
-            "Walk Through Attendance": AttendanceApp(),
+            "Attendance Management": AttendanceApp(),
         }
 
     @staticmethod
@@ -110,10 +110,10 @@ class SafeCampusLauncher:
         </style>
         """, unsafe_allow_html=True)
 
-        ANPR_IMG = self.app_configs["ANPR"]["icon_path"]
+        VEHICLE_ANALYTICS_IMG = self.app_configs["Vehicle Analytics"]["icon_path"]
         LAB_IMG = self.app_configs["Lab Surveillance"]["icon_path"]
         CLASS_IMG = self.app_configs["Classroom Surveillance"]["icon_path"]
-        ATTENDANCE_IMG = self.app_configs["Walk Through Attendance"]["icon_path"]
+        ATTENDANCE_IMG = self.app_configs["Attendance Management"]["icon_path"]
 
         st.markdown('<div class="fullscreen-center">', unsafe_allow_html=True)
         st.markdown('<div class="center-content">', unsafe_allow_html=True)
@@ -124,8 +124,12 @@ class SafeCampusLauncher:
         selected_project = None
 
         with col1:
-            if self._clickable_image(ANPR_IMG, "anpr_card_click", "ANPR"):
-                selected_project = "ANPR"
+            if self._clickable_image(
+                VEHICLE_ANALYTICS_IMG,
+                "vehicle_analytics_card_click",
+                "Vehicle Analytics",
+            ):
+                selected_project = "Vehicle Analytics"
 
         with col2:
             if self._clickable_image(LAB_IMG, "lab_card_click", "Lab Surveillance"):
@@ -139,9 +143,9 @@ class SafeCampusLauncher:
             if self._clickable_image(
                 ATTENDANCE_IMG,
                 "attendance_card_click",
-                "Walk Through Attendance",
+                "Attendance Management",
             ):
-                selected_project = "Walk Through Attendance"
+                selected_project = "Attendance Management"
 
         st.markdown('</div>', unsafe_allow_html=True)
         st.markdown('</div>', unsafe_allow_html=True)

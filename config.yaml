@@ -1,18 +1,34 @@
 applications:
-  anpr:
+  vehicle_analytics:
     database_path: "/home/abdullah/PycharmProjects/UET_Survelliance_Demo/assets/database/plates.db"
     live_frames_dir: "/home/abdullah/PycharmProjects/UET_Survelliance_Demo/outputs/live"
-    icon_path: "/home/abdullah/PycharmProjects/UETSafeCampusDashboard/assets/images/anpr_card.png"
+    # Switch live view source:
+    # - "frame_files" reads saved camera frames from `live_frames_dir`
+    # - "stream_api" reads running stream status and MJPEG URLs from `streams_api_url`
+    stream_source_mode: "stream_api"
+    # Vehicle stream API endpoint used when `stream_source_mode` is "stream_api".
+    streams_api_url: "http://127.0.0.1:8082/api/streams"
+    # Browser-reachable base URL for the actual live MJPEG stream endpoints.
+    # Leave empty only if clients can directly reach the same host in `streams_api_url`.
+    streams_public_base_url: ""
+    icon_path: "/home/abdullah/PycharmProjects/UETSafeCampusDashboard/assets/images/vehicle analytics.png"
+    table_names:
+      plates: "plates"
+      registered_vehicles: "registered_vehicles"
 
   lab_surveillance:
     root_dir: "/home/abdullah/PycharmProjects/CvmlLabSurviellance"
-    face_db_path: "/home/abdullah/PycharmProjects/CvmlLabSurviellance/faces.db"
-    activity_db_path: "/home/abdullah/PycharmProjects/CvmlLabSurviellance/activity_logs.db"
+    face_db_path: "/home/abdullah/PycharmProjects/CvmlLabSurviellance/assets/database/faces.db"
+    activity_db_path: "/home/abdullah/PycharmProjects/CvmlLabSurviellance/outputs/database/activity_logs.db"
     live_image_path: "/home/abdullah/PycharmProjects/CvmlLabSurviellance/outputs/live/live_latest.jpg"
     live_frames_dir: "/home/abdullah/PycharmProjects/CvmlLabSurviellance/outputs/live"
     activity_images_dir: "/home/abdullah/PycharmProjects/CvmlLabSurviellance/outputs/activities"
     region_output_dir: "/home/abdullah/PycharmProjects/CvmlLabSurviellance/outputs/regions"
     icon_path: "/home/abdullah/PycharmProjects/UETSafeCampusDashboard/assets/images/lab_surveillance_card.png"
+    table_names:
+      face_samples: "face_samples"
+      monitoring_logs: "monitoring_logs"
+      region_chunks: "region_chunks"
 
   classroom_surveillance:
     root_dir: "/home/abdullah/PycharmProjects/Classroom Survelliance"
@@ -21,13 +37,30 @@ applications:
     live_frames_dir: "/home/abdullah/PycharmProjects/Classroom Survelliance/outputs/latest_frames"
     stream_status_dir: "/home/abdullah/PycharmProjects/Classroom Survelliance/outputs/stream_status"
     icon_path: "/home/abdullah/PycharmProjects/UETSafeCampusDashboard/assets/images/classroom_srvelliance.png"
+    table_names:
+      face_samples: "face_samples"
+      monitoring_logs: "monitoring_logs"
 
-  attendance:
+  attendance_monitoring:
     root_dir: "/home/abdullah/PycharmProjects/Ai Classroom Attendance"
-    face_db_path: "/home/abdullah/PycharmProjects/Ai Classroom Attendance/faces.db"
-    activity_db_path: "/home/abdullah/PycharmProjects/Ai Classroom Attendance/activity_logs.db"
-    live_frames_dir: "/home/abdullah/PycharmProjects/Ai Classroom Attendance/live_frames"
-    icon_path: "/home/abdullah/PycharmProjects/UETSafeCampusDashboard/assets/images/walk_thorough_attendance_system.png"
+    face_db_path: "/home/abdullah/PycharmProjects/Ai Classroom Attendance/assets/database/faces.db"
+    activity_db_path: "/home/abdullah/PycharmProjects/Ai Classroom Attendance/outputs/database/activity_logs.db"
+    live_frames_dir: "/home/abdullah/PycharmProjects/Ai Classroom Attendance/outputs/live_frames"
+    # Switch live view source:
+    # - "frame_files" reads status JSON and saved frames from `live_frames_dir`
+    # - "stream_api" reads running stream status and MJPEG URLs from `streams_api_url`
+    stream_source_mode: "stream_api"
+    # Attendance stream API endpoint used when `stream_source_mode` is "stream_api".
+    streams_api_url: "http://127.0.0.1:8080/api/streams"
+    # Browser-reachable base URL for the actual live MJPEG stream endpoints.
+    # Example: "http://SERVER_IP:8080" or "https://streams.example.com"
+    # Leave empty only if clients can directly reach the same host in `streams_api_url`.
+    streams_public_base_url: "https://streams.uetaiprojects.com"
+    icon_path: "/home/abdullah/PycharmProjects/UETSafeCampusDashboard/assets/images/attendance_management.png"
+    table_names:
+      attendance_monitoring: "attendance_table"
+      face_samples: "face_samples"
+      monitoring_logs: "monitoring_logs"
 
 face_registration:
   guide_width_ratio: 0.38

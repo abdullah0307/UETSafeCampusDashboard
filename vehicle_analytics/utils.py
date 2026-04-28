@@ -2,15 +2,18 @@ import os
 import re
 import sqlite3
 from abc import ABC, abstractmethod
-from datetime import datetime, time
+from datetime import datetime, time, timezone
+from urllib.parse import urljoin, urlsplit
 
 import cv2
 import numpy as np
 import pandas as pd
 import plotly.express as px
+import requests
 import streamlit as st
 import yaml
 from PIL import Image
+import streamlit.components.v1 as components
 from streamlit_autorefresh import st_autorefresh
 
 from utils.app_config import get_application_config
@@ -23,7 +26,7 @@ from utils.pagination import PaginationManager
 
 class ConfigManager:
     def __init__(self, config=None):
-        self._config = config or get_application_config("anpr")
+        self._config = config or get_application_config("vehicle_analytics")
 
     @property
     def db_path(self):
@@ -32,6 +35,18 @@ class ConfigManager:
     @property
     def live_frames_dir(self):
         return self._config["live_frames_dir"]
+
+    @property
+    def stream_source_mode(self):
+        return self._config.get("stream_source_mode", "frame_files")
+
+    @property
+    def streams_api_url(self):
+        return self._config.get("streams_api_url", "")
+
+    @property
+    def streams_public_base_url(self):
+        return self._config.get("streams_public_base_url", "")
 
 
 # ==============================
@@ -917,82 +932,301 @@ class BasePage(ABC):
 # ==============================
 
 class LiveMonitorPage(BasePage):
-    def __init__(self, plate_repo):
+    STATUS_STALE_AFTER_SECONDS = 10
+
+    def __init__(
+        self,
+        plate_repo,
+        live_frames_dir,
+        stream_source_mode="frame_files",
+        streams_api_url=None,
+        streams_public_base_url=None,
+    ):
         super().__init__("📡 Live Camera View")
         self.repo = plate_repo
-        self.config = ConfigManager()
+        self.live_frames_dir = str(live_frames_dir)
+        self.stream_source_mode = self._normalize_stream_source_mode(stream_source_mode)
+        self.streams_api_url = str(streams_api_url or "").strip()
+        self.streams_public_base_url = str(streams_public_base_url or "").strip()
+
+    @staticmethod
+    def _normalize_stream_source_mode(stream_source_mode):
+        mode = str(stream_source_mode or "frame_files").strip().lower()
+        aliases = {
+            "live_frames_dir": "frame_files",
+            "live_frames": "frame_files",
+            "frame_files": "frame_files",
+            "stream_api": "stream_api",
+            "api": "stream_api",
+        }
+        return aliases.get(mode, "frame_files")
+
+    def _is_stream_alive(self, payload):
+        if not isinstance(payload, dict):
+            return False
+
+        status_value = str(payload.get("status") or "").strip().lower()
+        if status_value != "running":
+            return False
+
+        last_update_text = str(payload.get("last_update") or "").strip()
+        if not last_update_text:
+            return False
+
+        try:
+            if "T" in last_update_text:
+                last_update = datetime.fromisoformat(last_update_text.replace("Z", "+00:00"))
+                current_time = datetime.now(last_update.tzinfo or timezone.utc)
+            else:
+                last_update = datetime.strptime(last_update_text, "%Y-%m-%d %H:%M:%S")
+                current_time = datetime.now()
+        except ValueError:
+            return False
+
+        age_seconds = (current_time - last_update).total_seconds()
+        return age_seconds <= self.STATUS_STALE_AFTER_SECONDS
+
+    def _streams_api_base_url(self):
+        if not self.streams_api_url:
+            return ""
+        parts = urlsplit(self.streams_api_url)
+        if not parts.scheme or not parts.netloc:
+            return ""
+        return f"{parts.scheme}://{parts.netloc}"
+
+    def _streams_public_base(self):
+        candidate = self.streams_public_base_url or self._streams_api_base_url()
+        parts = urlsplit(candidate)
+        if not parts.scheme or not parts.netloc:
+            return ""
+        return f"{parts.scheme}://{parts.netloc}"
+
+    def _resolve_public_stream_url(self, video_url):
+        video_url = str(video_url or "").strip()
+        if not video_url:
+            return ""
+
+        public_base = self._streams_public_base()
+        if not public_base:
+            return video_url
+
+        parsed = urlsplit(video_url)
+        path = parsed.path or ""
+        if parsed.query:
+            path = f"{path}?{parsed.query}"
+
+        if path:
+            return urljoin(f"{public_base}/", path.lstrip("/"))
+        return video_url
+
+    def _load_stream_cards_from_files(self, selected_cameras):
+        cards = []
+        latest_frame_mtime = 0.0
+
+        for cam in selected_cameras:
+            image_path = os.path.join(self.live_frames_dir, f"{cam}.jpg")
+            card = {
+                "stream_name": str(cam),
+                "frame_path": image_path,
+                "alive": False,
+                "mtime": None,
+                "error": None,
+                "source_mode": "frame_files",
+            }
+
+            if os.path.exists(image_path):
+                try:
+                    mtime = os.path.getmtime(image_path)
+                    current_time = datetime.now().timestamp()
+                    card["alive"] = (current_time - mtime) <= 30
+                    card["mtime"] = mtime
+                    latest_frame_mtime = max(latest_frame_mtime, mtime)
+                except Exception as exc:
+                    card["error"] = str(exc)
+
+            cards.append(card)
+
+        return cards, latest_frame_mtime
+
+    def _load_stream_cards_from_api(self):
+        if not self.streams_api_url:
+            return []
+
+        try:
+            response = requests.get(self.streams_api_url, timeout=5)
+            response.raise_for_status()
+            data = response.json()
+        except Exception:
+            return []
+
+        if isinstance(data, list):
+            streams = data
+        elif isinstance(data, dict):
+            streams = data.get("streams", [])
+        else:
+            return []
+
+        if not isinstance(streams, list):
+            return []
+
+        base_url = self._streams_api_base_url()
+        cards = []
+        for entry in streams:
+            if not isinstance(entry, dict):
+                continue
+
+            payload = entry.get("status")
+            if not isinstance(payload, dict):
+                payload = {}
+
+            stream_id = entry.get("stream_id")
+            display_name = str(
+                payload.get("display_name")
+                or payload.get("source")
+                or entry.get("source")
+                or ""
+            ).strip()
+            cards.append(
+                {
+                    "stream_id": stream_id,
+                    "stream_name": display_name or f"Stream {stream_id}",
+                    "video_url": urljoin(base_url, str(entry.get("video_url") or "").strip()),
+                    "status_url": urljoin(base_url, str(entry.get("status_url") or "").strip()),
+                    "payload": payload,
+                    "alive": self._is_stream_alive(payload),
+                    "source_mode": "stream_api",
+                }
+            )
+
+        return cards
+
+    def _render_stream_api_card(self, card):
+        payload = card.get("payload") or {}
+        public_video_url = self._resolve_public_stream_url(card.get("video_url"))
+
+        if public_video_url:
+            components.html(
+                f"""
+                <div style="width:100%;background:#000;border-radius:0.5rem;overflow:hidden;">
+                  <img
+                    src="{public_video_url}"
+                    alt="{card.get('stream_name', 'Live Stream')}"
+                    style="display:block;width:100%;height:auto;min-height:260px;object-fit:contain;background:#000;"
+                  />
+                </div>
+                """,
+                height=320,
+            )
+        else:
+            st.info("No live stream URL available.")
+
+        metric_cols = st.columns(3)
+        metric_cols[0].metric("Detected", int(payload.get("detected_count", 0) or 0))
+        metric_cols[1].metric("Recognized", int(payload.get("recognized_count", 0) or 0))
+        metric_cols[2].metric("FPS", f"{float(payload.get('fps', 0.0) or 0.0):.2f}")
+
+        st.caption(
+            f"Source: {payload.get('source', 'N/A')} | "
+            f"Started: {payload.get('stream_started_at', 'N/A')} | "
+            f"Last Update: {payload.get('last_update', 'N/A')}"
+        )
+        if card.get("status_url"):
+            st.caption(f"Status URL: {card['status_url']}")
 
     def render(self):
         self.show_title()
+        is_stream_api_mode = self.stream_source_mode == "stream_api"
+
+        if is_stream_api_mode:
+            st.caption("Live vehicle stream overview using URL stream API.")
+            controls = st.columns([1, 1, 1, 2])
+            auto_refresh = controls[0].toggle(
+                "Auto refresh",
+                value=False,
+                key="vehicle_live_auto_refresh",
+                help="Refresh live stream status periodically. Enabling this restarts MJPEG playback on each rerun.",
+            )
+            refresh_interval = controls[1].selectbox(
+                "Interval",
+                options=[5, 15, 30, 60],
+                index=1,
+                key="vehicle_live_refresh_interval",
+                disabled=not auto_refresh,
+            )
+            controls[2].button("Refresh now", key="vehicle_live_refresh_now")
+            if auto_refresh:
+                st_autorefresh(
+                    interval=int(refresh_interval) * 1000,
+                    key="vehicle_live_status_refresh",
+                )
+            else:
+                controls[3].caption("Auto refresh is off.")
+
+            stream_cards = [card for card in self._load_stream_cards_from_api() if card["alive"]]
+            if not stream_cards:
+                st.info("No live vehicle streams were found.")
+                return
+
+            cols = st.columns(2)
+            for idx, card in enumerate(stream_cards):
+                with cols[idx % 2]:
+                    with st.container(border=True):
+                        st.subheader(card["stream_name"])
+                        if card["alive"]:
+                            st.success("stream is alive")
+                        else:
+                            st.error("stream is not alive")
+                        self._render_stream_api_card(card)
+            return
 
         cameras = self.repo.get_cameras()
-
         if not cameras:
             st.warning("No cameras detected yet.")
             return
 
-        selected_cameras = st.multiselect(
-            "Select Cameras",
-            cameras,
-            default=cameras,
-        )
+        selected_cameras = st.multiselect("Select Cameras", cameras, default=cameras)
         st.caption("Live view auto-updates as soon as new frame files are detected.")
-
         if not selected_cameras:
             st.info("Select at least one camera.")
             return
 
         st.divider()
-
-        latest_frame_mtime = 0.0
-
-        # Dynamic grid layout
+        stream_cards, latest_frame_mtime = self._load_stream_cards_from_files(selected_cameras)
         columns_per_row = 2 if len(selected_cameras) > 1 else 1
 
-        for i in range(0, len(selected_cameras), columns_per_row):
-            row_cams = selected_cameras[i:i + columns_per_row]
+        for i in range(0, len(stream_cards), columns_per_row):
+            row_cards = stream_cards[i:i + columns_per_row]
             cols = st.columns(columns_per_row)
 
-            for col, cam in zip(cols, row_cams):
+            for col, card in zip(cols, row_cards):
                 with col:
-                    st.markdown(f"### 🎥 {cam}")
-
-                    image_path = os.path.join(self.config.live_frames_dir, f"{cam}.jpg")
+                    st.markdown(f"### 🎥 {card['stream_name']}")
+                    image_path = card["frame_path"]
 
                     if os.path.exists(image_path):
+                        if card["alive"]:
+                            try:
+                                img = Image.open(image_path)
+                                img.verify()
+                                img = Image.open(image_path)
+                                st.image(img, width="content")
 
-                        try:
-                            # Try reading image safely
-                            img = Image.open(image_path)
-                            img.verify()  # verify integrity
-
-                            # Re-open after verify (PIL requirement)
-                            img = Image.open(image_path)
-
-                            st.image(img, width='content')
-
-                            modified_time = datetime.fromtimestamp(
-                                os.path.getmtime(image_path)
-                            ).strftime("%Y-%m-%d %H:%M:%S")
-                            latest_frame_mtime = max(
-                                latest_frame_mtime,
-                                os.path.getmtime(image_path),
-                            )
-
-                            st.caption(f"Last updated: {modified_time}")
-
-                        except Exception:
-                            # Frame being written or corrupted
-                            st.info("🔄 Loading latest frame...")
-                            st.empty()
-
+                                modified_time = datetime.fromtimestamp(card["mtime"]).strftime("%Y-%m-%d %H:%M:%S")
+                                st.caption(f"Last updated: {modified_time}")
+                                st.success("🟢 Stream is live")
+                            except Exception:
+                                st.info("🔄 Loading latest frame...")
+                                st.empty()
+                        else:
+                            st.warning("🔴 Stream is not live")
+                            if card["mtime"] is not None:
+                                stale_time = datetime.fromtimestamp(card["mtime"]).strftime("%Y-%m-%d %H:%M:%S")
+                                st.info(f"Last frame captured at: {stale_time}")
                     else:
                         st.info("⏳ Waiting for camera feed...")
 
         previous_mtime = st.session_state.get("live_last_frame_mtime", 0.0)
         st.session_state["live_last_frame_mtime"] = max(previous_mtime, latest_frame_mtime)
-
-        # Fast polling for near-instant refresh when writer updates frames.
         st_autorefresh(interval=400, key="live_refresh_fast")
 
 
